@@ -5,16 +5,16 @@ Borrowed from golang stdlib, this enables logging at increasing
 levels of verbosity. The verbosity increases as we go down the list
 below:
 
-    - Emergency (LOG_EMERG) - will halt the program after
-      printing a backtrace of the calling goroutine.
-    - Critical (LOG_CRIT)
-    - Error (LOG_ERR) - all levels at and above will print a stack-trace
-      of the calling goroutine.
-    - Warning (LOG_WARNING)
-    - Informational (LOG_INFO) - this is the level at which I log
-      most informational messages useful for troubleshooting
-      production issues.
-    - Debug (LOG_DEBUG) - this is the most verbose level
+- Emergency (LOG_EMERG) - will halt the program after
+  printing a backtrace of the calling goroutine.
+- Critical (LOG_CRIT)
+- Error (LOG_ERR) - all levels at and above will print a stack-trace
+  of the calling goroutine.
+- Warning (LOG_WARNING)
+- Informational (LOG_INFO) - this is the level at which I log
+  most informational messages useful for troubleshooting
+  production issues.
+- Debug (LOG_DEBUG) - this is the most verbose level
 
 
 ## List of enhancements from the stdlib
