@@ -121,12 +121,15 @@ const (
 	LOG_ERR
 	LOG_CRIT
 	LOG_EMERG
+
+	// keep in the end
+	logMax
 )
 
 // Map string names to actual priority levels. Useful for taking log
 // levels defined in config files and turning them into usable
 // priorities.
-var PrioName = map[string]Priority{
+var prioName = map[string]Priority{
 	"LOG_DEBUG":   LOG_DEBUG,
 	"LOG_INFO":    LOG_INFO,
 	"LOG_WARNING": LOG_WARNING,
@@ -149,13 +152,20 @@ var PrioName = map[string]Priority{
 }
 
 // Map log priorities to their string names
-var PrioString = map[Priority]string{
+var prioString = map[Priority]string{
 	LOG_DEBUG:   "DEBUG",
 	LOG_INFO:    "INFO",
 	LOG_WARNING: "WARNING",
 	LOG_ERR:     "ERROR",
 	LOG_CRIT:    "CRITICAL",
 	LOG_EMERG:   "EMERGENCY",
+}
+
+func (p Priority) String() string {
+	if p < logMax {
+		return prioString[p]
+	}
+	return fmt.Sprintf("invalid-prio-%d", int(p))
 }
 
 // Since we now have sub-loggers, we need a way to keep the output
@@ -260,6 +270,14 @@ func (l *Logger) New(prefix string, prio Priority) *Logger {
 
 	nl.flag |= lSublog
 	return nl
+}
+
+
+// Convert a string to equivalent Priority
+func ToPriority(s string) (p Priority, ok bool) {
+	s = strings.ToUpper(s)
+	p, ok = prioName[s]
+	return
 }
 
 // Open a new file logger to write logs to 'file'.
