@@ -318,6 +318,9 @@ func NewLogger(name string, prio Priority, prefix string, flag int) (*Logger, er
 
 	flag &= ^(lSyslog | lPrefix | lClose)
 	switch strings.ToUpper(name) {
+	case "NONE":	// for test purposes
+		return New(&nullWriter{}, prio, prefix, flag)
+
 	case "SYSLOG":
 		return NewSyslog(prio, prefix, flag)
 
@@ -815,4 +818,12 @@ func rand64() uint64 {
 	rand.Read(b[:])
 	return binary.BigEndian.Uint64(b[:])
 }
+
+// null writer
+type nullWriter struct{}
+
+func (n *nullWriter) Write(b []byte) (int, error) {
+	return len(b), nil
+}
+
 // vim: ft=go:sw=8:ts=8:noexpandtab:tw=98:
