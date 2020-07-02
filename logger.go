@@ -208,7 +208,7 @@ func newLogger(ll *Logger) (*Logger, error) {
 
 	if len(ll.prefix) > 0 {
 		ll.flag |= lPrefix
-		ll.prefix = fmt.Sprintf("%s: ", ll.prefix)
+		ll.prefix = fmt.Sprintf("[%s] ", ll.prefix)
 	}
 
 	go ll.qrunner()
@@ -260,10 +260,14 @@ func (l *Logger) New(prefix string, prio Priority) *Logger {
 	if len(prefix) > 0 {
 		if (l.flag & lPrefix) != 0 {
 			n := len(l.prefix)
-			oldpref := l.prefix[:n-2]
-			nl.prefix = fmt.Sprintf("%s-%s: ", oldpref, prefix)
+			if n > 2 {
+				oldpref := l.prefix[:n-2]
+				nl.prefix = fmt.Sprintf("[%s-%s] ", oldpref, prefix)
+			} else {
+				nl.prefix = fmt.Sprintf("[%s-%s] ", l.prefix, prefix)
+			}
 		} else {
-			nl.prefix = fmt.Sprintf("%s: ", prefix)
+			nl.prefix = fmt.Sprintf("[%s] ", prefix)
 			nl.flag |= lPrefix
 		}
 	}
