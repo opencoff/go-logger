@@ -258,22 +258,27 @@ func (l *Logger) New(prefix string, prio Priority) *Logger {
 	nl := &Logger{out: l.out, prio: prio, flag: l.flag, ch: l.ch}
 
 	if len(prefix) > 0 {
+		oldpref := barePrefix(l.prefix)
 		if (l.flag & lPrefix) != 0 {
-			n := len(l.prefix)
-			if n > 2 {
-				oldpref := l.prefix[:n-2]
-				nl.prefix = fmt.Sprintf("[%s-%s] ", oldpref, prefix)
-			} else {
-				nl.prefix = fmt.Sprintf("[%s-%s] ", l.prefix, prefix)
-			}
+			nl.prefix = fmt.Sprintf("[%s-%s] ", oldpref, prefix)
 		} else {
 			nl.prefix = fmt.Sprintf("[%s] ", prefix)
-			nl.flag |= lPrefix
 		}
+		nl.flag |= lPrefix
 	}
 
 	nl.flag |= lSublog
 	return nl
+}
+
+func barePrefix(s string) string {
+	if s[0] == '[' {
+		s = s[1:]
+	}
+	if i := strings.LastIndex(s, "] "); i > 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 
