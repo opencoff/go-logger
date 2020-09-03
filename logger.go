@@ -173,9 +173,10 @@ func (p Priority) String() string {
 // abstraction together. There is only ever _one_ instance of this
 // struct in a top-level logger.
 type outch struct {
-	sync.Mutex
-	closed uint32      // atomically set/read
-	logch  chan string // buffered channel
+	closing uint32
+	closed  uint32      // atomically set/read
+	logch   chan string // buffered channel
+	wg      sync.WaitGroup
 }
 
 // A Logger represents an active logging object that generates lines of
@@ -190,11 +191,11 @@ type Logger struct {
 	out    io.Writer  // destination for output
 	name   string     // file name for file backed logs
 
-	rot_tm time.Time  // UTC time when file should be rotated
-	rot_n  int        // number of days of logs to keep
+	rot_tm time.Time // UTC time when file should be rotated
+	rot_n  int       // number of days of logs to keep
 
-	ch     *outch     // output chan
-	wait   chan bool  // wait chan for closing the log
+	ch   *outch    // output chan
+	wait chan bool // wait chan for closing the log
 
 	gl *stdlog.Logger // cached pointer to stdlogger if any; created by StdLogger()
 }
@@ -211,31 +212,24 @@ func newLogger(ll *Logger) (*Logger, error) {
 		ll.prefix = fmt.Sprintf("[%s] ", ll.prefix)
 	}
 
+	ll.ch.wg.Add(1)
 	go ll.qrunner()
 
 	return ll, nil
 }
 
-func (l *Logger) closeCh() (r uint32) {
-	l.ch.Lock()
-	if r = atomic.SwapUint32(&l.ch.closed, 1); r == 0 {
+// Close the logger and wait for I/O to complete
+func (l *Logger) Close() error {
+	if 0 != (l.flag & lSublog) {
+		return nil
+	}
+
+	atomic.SwapUint32(&l.ch.closing, 1)
+	if atomic.SwapUint32(&l.ch.closed, 1) == 0 {
 		close(l.ch.logch)
 	}
-	l.ch.Unlock()
-
-	return r
-}
-
-// Close the logger and wait for I/O to complete
-func (l *Logger) Close() {
-	if 0 != (l.flag & lSublog) {
-		return
-	}
-
-	if z := l.closeCh(); z == 0 {
-		//fmt.Printf("## Closing Logger; closed=%v\n", l.ch.closed)
-		_, _ = <-l.wait
-	}
+	l.ch.wg.Wait()
+	return nil
 }
 
 // Creates a new Logger instance. The 'out' variable sets the
@@ -243,6 +237,7 @@ func (l *Logger) Close() {
 // The prefix appears at the beginning of each generated log line.
 // The flag argument defines the logging properties.
 func New(out io.Writer, prio Priority, prefix string, flag int) (*Logger, error) {
+	flag = defaultFlag(flag)
 	return newLogger(&Logger{out: out, prio: prio, prefix: prefix, flag: flag})
 }
 
@@ -281,7 +276,6 @@ func barePrefix(s string) string {
 	return s
 }
 
-
 // Convert a string to equivalent Priority
 func ToPriority(s string) (p Priority, ok bool) {
 	s = strings.ToUpper(s)
@@ -289,11 +283,20 @@ func ToPriority(s string) (p Priority, ok bool) {
 	return
 }
 
+func defaultFlag(flag int) int {
+	if flag == 0 {
+		flag = Ldate | Ltime | Lshortfile | Lmicroseconds
+	}
+
+	flag &= ^(lSyslog | lPrefix | lClose)
+	return flag
+}
+
 // Open a new file logger to write logs to 'file'.
 // This function erases the previous file contents. This is the only
 // constructor that allows you to subsequently configure a log-rotator.
 func NewFilelog(file string, prio Priority, prefix string, flag int) (*Logger, error) {
-	flag &= ^(lSyslog | lPrefix | lClose)
+	flag = defaultFlag(flag)
 
 	// We use O_RDWR because we will likely rotate the file and it
 	// will help us to seek(0) and read the logs for purposes of
@@ -325,9 +328,9 @@ func NewSyslog(prio Priority, prefix string, flag int) (*Logger, error) {
 // Create a new file logger or syslog logger
 func NewLogger(name string, prio Priority, prefix string, flag int) (*Logger, error) {
 
-	flag &= ^(lSyslog | lPrefix | lClose)
+	flag = defaultFlag(flag)
 	switch strings.ToUpper(name) {
-	case "NONE":	// for test purposes
+	case "NONE": // for test purposes
 		return New(&nullWriter{}, prio, prefix, flag)
 
 	case "SYSLOG":
@@ -392,131 +395,6 @@ func (l *Logger) EnableRotation(hh, mm, ss int, max int) error {
 	return nil
 }
 
-// Cheap integer to fixed-width decimal ASCII.  Give a negative width to avoid zero-padding.
-// Knows the buffer has capacity.
-func itoa(i int, wid int) string {
-	var u uint = uint(i)
-	if u == 0 && wid <= 1 {
-		return "0"
-	}
-
-	// Assemble decimal in reverse order.
-	var b [32]byte
-	bp := len(b)
-	for ; u > 0 || wid > 0; u /= 10 {
-		bp--
-		wid--
-		b[bp] = byte(u%10) + '0'
-	}
-
-	return string(b[bp:])
-}
-
-func (l *Logger) formatHeader(t time.Time) string {
-	var s string
-
-	//*buf = append(*buf, l.prefix...)
-	if l.flag&(Ldate|Ltime|Lmicroseconds) != 0 {
-		if l.flag&Ldate != 0 {
-			year, month, day := t.Date()
-			s += itoa(year, 4)
-			s += "/"
-			s += itoa(int(month), 2)
-			s += "/"
-			s += itoa(day, 2)
-		}
-		if l.flag&(Ltime|Lmicroseconds) != 0 {
-			hour, min, sec := t.Clock()
-
-			s += " "
-			s += itoa(hour, 2)
-			s += ":"
-			s += itoa(min, 2)
-			s += ":"
-			s += itoa(sec, 2)
-			if l.flag&Lmicroseconds != 0 {
-				s += "."
-				s += itoa(t.Nanosecond()/1e3, 6)
-			}
-		}
-	}
-	return s
-}
-
-// Output formats the output for a logging event.  The string s contains
-// the text to print after the prefix specified by the flags of the
-// Logger.  A newline is appended if the last character of s is not
-// already a newline.  Calldepth is used to recover the PC and is
-// provided for generality, although at the moment on all pre-defined
-// paths it will be 2.
-func (l *Logger) ofmt(calldepth int, prio Priority, s string) string {
-	if len(s) == 0 {
-		return s
-	}
-
-	var buf string
-
-	// Put the timestamp and priority only if we are NOT syslog
-	if (l.flag & lSyslog) == 0 {
-		now := time.Now().UTC()
-		buf = fmt.Sprintf("<%d>:%s ", prio, l.formatHeader(now))
-	}
-
-	if (l.flag & lPrefix) != 0 {
-		buf += l.prefix
-	}
-
-	if calldepth > 0 {
-		var file string
-		var line int
-		var finfo string
-		if l.flag&(Lshortfile|Llongfile) != 0 {
-			var ok bool
-			_, file, line, ok = runtime.Caller(calldepth)
-			if !ok {
-				file = "???"
-				line = 0
-			}
-			if l.flag&Lshortfile != 0 {
-				short := file
-				for i := len(file) - 1; i > 0; i-- {
-					if file[i] == '/' {
-						short = file[i+1:]
-						break
-					}
-				}
-				file = short
-			}
-			finfo = fmt.Sprintf("(%s:%d) ", file, line)
-		}
-
-		if len(finfo) > 0 {
-			buf += finfo
-		}
-	}
-
-	//buf = append(buf, fmt.Sprintf(":<%d>: ", prio)...)
-	buf += s
-	if s[len(s)-1] != '\n' {
-		buf += "\n"
-	}
-
-	return buf
-}
-
-// Enqueue a write to be flushed by qrunner()
-func (l *Logger) qwrite(s string) {
-	// NB: close(ch) happens under the lock. Therefore, any writes
-	// to ch must also be under the same lock. Thus, z == 0 tells
-	// us that the channel is alive and kicking, and therefore, we can shove
-	// some items to it.
-	l.ch.Lock()
-	if z := atomic.LoadUint32(&l.ch.closed); z == 0 {
-		l.ch.logch <- s
-	}
-	l.ch.Unlock()
-}
-
 // Enqueue a log-write to happen asynchronously
 func (l *Logger) Output(calldepth int, prio Priority, s string) {
 	if calldepth > 0 {
@@ -527,22 +405,13 @@ func (l *Logger) Output(calldepth int, prio Priority, s string) {
 	l.qwrite(t)
 }
 
-// Write to the underlying FD directly; INTERNAL USE ONLY
-func (l *Logger) directWrite(calldepth int, prio Priority, s string) {
-	if calldepth > 0 {
-		calldepth += 1
-	}
-	t := l.ofmt(calldepth, prio, s)
-	l.out.Write([]byte(t))
-}
-
 // Dump stack backtrace for 'depth' levels
 // Backtrace is of the form "file:line [func name]"
 // NB: The absolute pathname of the file is used in the backtrace -
 //     regardless of the logger flags requesting shortfile.
 func (l *Logger) Backtrace(depth int) {
 	var pc []uintptr = make([]uintptr, 64)
-	var v []string
+	var wr strings.Builder
 
 	// runtime.Callers() requires a pre-created array.
 	n := runtime.Callers(3, pc)
@@ -553,24 +422,22 @@ func (l *Logger) Backtrace(depth int) {
 		n = depth
 	}
 
+	wr.WriteString("Backtrace:\n    ")
 	for i := 0; i < n; i++ {
-		var s string = "*unknown*"
+		var s string = "    *unknown*\n"
 		p := pc[i]
 		f := runtime.FuncForPC(p)
 
 		if f != nil {
 			nm := f.Name()
 			file, line := f.FileLine(p)
-			s = fmt.Sprintf("%s:%d [%s]", file, line, nm)
+			s = fmt.Sprintf("    %s:%d [%s]\n", file, line, nm)
 		}
-		v = append(v, s)
+		wr.WriteString(s)
 	}
-	v = append(v, "\n")
+	wr.WriteRune('\n')
 
-	str := "Backtrace:\n    " + strings.Join(v, "\n    ")
-	if z := atomic.LoadUint32(&l.ch.closed); z == 0 {
-		l.ch.logch <- str
-	}
+	l.qwrite(wr.String())
 }
 
 // Predicate that returns true if we can log at level prio
@@ -691,8 +558,142 @@ func (l *Logger) SetPrefix(prefix string) {
 
 // -- Internal functions --
 
+// Cheap integer to fixed-width decimal ASCII.  Give a negative width to avoid zero-padding.
+// Knows the buffer has capacity.
+func itoa(i int, wid int) string {
+	var u uint = uint(i)
+	if u == 0 && wid <= 1 {
+		return "0"
+	}
+
+	// Assemble decimal in reverse order.
+	var b [32]byte
+	bp := len(b)
+	for ; u > 0 || wid > 0; u /= 10 {
+		bp--
+		wid--
+		b[bp] = byte(u%10) + '0'
+	}
+
+	return string(b[bp:])
+}
+
+func (l *Logger) formatHeader(t time.Time) string {
+	var s string
+
+	//*buf = append(*buf, l.prefix...)
+	if l.flag&(Ldate|Ltime|Lmicroseconds) != 0 {
+		if l.flag&Ldate != 0 {
+			year, month, day := t.Date()
+			s += itoa(year, 4)
+			s += "/"
+			s += itoa(int(month), 2)
+			s += "/"
+			s += itoa(day, 2)
+		}
+		if l.flag&(Ltime|Lmicroseconds) != 0 {
+			hour, min, sec := t.Clock()
+
+			s += " "
+			s += itoa(hour, 2)
+			s += ":"
+			s += itoa(min, 2)
+			s += ":"
+			s += itoa(sec, 2)
+			if l.flag&Lmicroseconds != 0 {
+				s += "."
+				s += itoa(t.Nanosecond()/1e3, 6)
+			}
+		}
+	}
+	return s
+}
+
+// Output formats the output for a logging event.  The string s contains
+// the text to print after the prefix specified by the flags of the
+// Logger.  A newline is appended if the last character of s is not
+// already a newline.  Calldepth is used to recover the PC and is
+// provided for generality, although at the moment on all pre-defined
+// paths it will be 2.
+func (l *Logger) ofmt(calldepth int, prio Priority, s string) string {
+	if len(s) == 0 {
+		return s
+	}
+
+	var buf string
+
+	// Put the timestamp and priority only if we are NOT syslog
+	if (l.flag & lSyslog) == 0 {
+		now := time.Now().UTC()
+		buf = fmt.Sprintf("<%d>:%s ", prio, l.formatHeader(now))
+	}
+
+	if (l.flag & lPrefix) != 0 {
+		buf += l.prefix
+	}
+
+	if calldepth > 0 {
+		var file string
+		var line int
+		var finfo string
+		if l.flag&(Lshortfile|Llongfile) != 0 {
+			var ok bool
+			_, file, line, ok = runtime.Caller(calldepth)
+			if !ok {
+				file = "???"
+				line = 0
+			}
+			if l.flag&Lshortfile != 0 {
+				short := file
+				for i := len(file) - 1; i > 0; i-- {
+					if file[i] == '/' {
+						short = file[i+1:]
+						break
+					}
+				}
+				file = short
+			}
+			finfo = fmt.Sprintf("(%s:%d) ", file, line)
+		}
+
+		if len(finfo) > 0 {
+			buf += finfo
+		}
+	}
+
+	//buf = append(buf, fmt.Sprintf(":<%d>: ", prio)...)
+	buf += s
+	if s[len(s)-1] != '\n' {
+		buf += "\n"
+	}
+
+	return buf
+}
+
+// Write to the underlying FD directly; INTERNAL USE ONLY
+func (l *Logger) directWrite(calldepth int, prio Priority, s string) {
+	if calldepth > 0 {
+		calldepth += 1
+	}
+	t := l.ofmt(calldepth, prio, s)
+	l.out.Write([]byte(t))
+}
+
+// Enqueue a write to be flushed by qrunner()
+// Senders are responsible for closing the channel - but only once.
+func (l *Logger) qwrite(s string) {
+	if z := atomic.LoadUint32(&l.ch.closing); z == 0 {
+		l.ch.logch <- s
+	} else {
+		if atomic.SwapUint32(&l.ch.closed, 1) == 0 {
+			close(l.ch.logch)
+		}
+	}
+}
+
 // Go routine to do async log writes
 func (l *Logger) qrunner() {
+	defer l.ch.wg.Done()
 
 	for s := range l.ch.logch {
 		if 0 != (l.flag & lRotate) {
@@ -720,8 +721,6 @@ func (l *Logger) qrunner() {
 			fd.Close()
 		}
 	}
-
-	close(l.wait)
 }
 
 // Rotate current file out
