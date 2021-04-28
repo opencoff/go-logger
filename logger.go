@@ -196,6 +196,7 @@ type Logger struct {
 	prefix string     // prefix to write at beginning of each line
 	flag   int        // properties
 	out    io.Writer  // destination for output
+	count  uint64     // count of # of log lines so far - used for rel-timestamp
 	name   string     // file name for file backed logs
 
 	rot_tm time.Time // UTC time when file should be rotated
@@ -591,17 +592,8 @@ func itoa(i int, wid int) string {
 	return string(b[bp:])
 }
 
-func (l *Logger) formatHeader(t time.Time) string {
-	// handle relative time quickly
-	if (l.flag & LReltime) != 0 {
-		d := t.Sub(_startTime)
-		if (l.flag & Lmicroseconds) == 0 {
-			d = d.Round(time.Millisecond)
-		}
-		return "+" + d.String()
-	}
-
-	// Full date/time formatting
+// Full date/time formatting
+func (l *Logger) fullTimestamp(t time.Time) string {
 	var s string
 	if l.flag&(Ldate|Ltime|Lmicroseconds) != 0 {
 		if l.flag&Ldate != 0 {
@@ -628,6 +620,23 @@ func (l *Logger) formatHeader(t time.Time) string {
 		}
 	}
 	return s
+}
+
+func (l *Logger) formatHeader(t time.Time) string {
+	// handle relative time quickly
+	if (l.flag & LReltime) != 0 {
+		// if this is the first time, do the full time stamp.
+		if atomic.AddUint64(&l.count, 1) == 0 {
+			return l.fullTimestamp(t)
+		}
+		d := t.Sub(_startTime)
+		if (l.flag & Lmicroseconds) == 0 {
+			d = d.Round(time.Millisecond)
+		}
+		return "+" + d.String()
+	}
+
+	return l.fullTimestamp(t)
 }
 
 // Output formats the output for a logging event.  The string s contains
@@ -726,7 +735,9 @@ func (l *Logger) qrunner() {
 
 				// Set next rotation for +24 hours
 				l.rot_tm = n.Add(24 * time.Hour)
-				//l.rot_tm = n.Add(2 * time.Minute)
+
+				// reset the counter so the first log message has full time stamp.
+				atomic.StoreUint64(&l.count, 0)
 
 				l.directWrite(0, LOG_INFO,
 					fmt.Sprintf("Log rotation complete. Next rotate at %s..",
