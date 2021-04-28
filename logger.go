@@ -85,9 +85,10 @@ const (
 	Lmicroseconds             // microsecond resolution: 01:23:23.123123.  assumes Ltime.
 	Llongfile                 // full file name and line number: /a/b/c/d.go:23
 	Lshortfile                // final file name element and line number: d.go:23. overrides Llongfile
+	LReltime                  // print relative time from start of program
 
 	// Internal flags
-	lSyslog // set to indicate that output destination is syslog
+	lSyslog // set to indicate that output destination is syslog; Ldate|Ltime|Lmicroseconds are ignored
 	lPrefix // set if prefix is non-zero
 	lClose  // close the file when done
 	lSublog // Set if this is a sub-logger
@@ -125,6 +126,12 @@ const (
 	// keep in the end
 	logMax
 )
+
+var _startTime time.Time
+
+func init() {
+	_startTime = time.Now().UTC()
+}
 
 // Map string names to actual priority levels. Useful for taking log
 // levels defined in config files and turning them into usable
@@ -245,7 +252,6 @@ func New(out io.Writer, prio Priority, prefix string, flag int) (*Logger, error)
 // This is useful when different components in a large program want
 // their own log-prefix (for easier debugging)
 func (l *Logger) New(prefix string, prio Priority) *Logger {
-
 	if prio == LOG_NONE {
 		prio = l.prio
 	}
@@ -288,6 +294,12 @@ func defaultFlag(flag int) int {
 		flag = Ldate | Ltime | Lshortfile | Lmicroseconds
 	}
 
+	// Reltime overrides any date+timestamp
+	// We however retain Lmicroseconds
+	if (flag & LReltime) != 0 {
+		flag &= ^(Ldate | Ltime)
+	}
+
 	flag &= ^(lSyslog | lPrefix | lClose)
 	return flag
 }
@@ -316,7 +328,7 @@ func NewFilelog(file string, prio Priority, prefix string, flag int) (*Logger, e
 func NewSyslog(prio Priority, prefix string, flag int) (*Logger, error) {
 	flag &= ^(lSyslog | lPrefix | lClose)
 
-	wr, err := syslog.New(syslog.LOG_NOTICE|syslog.LOG_USER, "")
+	wr, err := syslog.New(syslog.LOG_NOTICE|syslog.LOG_DAEMON, "")
 	if err != nil {
 		s := fmt.Sprintf("Can't open SYSLOG connection: %s", err)
 		return nil, errors.New(s)
@@ -460,7 +472,7 @@ func (l *Logger) Print(v ...interface{}) {
 // Fatalf is equivalent to l.Printf() followed by a call to os.Exit(1).
 func (l *Logger) Fatal(format string, v ...interface{}) {
 	l.Output(2, LOG_EMERG, fmt.Sprintf(format, v...))
-	l.Backtrace(0)
+	l.Close()
 	os.Exit(1)
 }
 
@@ -469,6 +481,7 @@ func (l *Logger) Panic(format string, v ...interface{}) {
 	s := fmt.Sprintf(format, v...)
 	l.Output(2, LOG_EMERG, s)
 	l.Backtrace(5)
+	l.Close()
 	panic(s)
 }
 
@@ -579,9 +592,17 @@ func itoa(i int, wid int) string {
 }
 
 func (l *Logger) formatHeader(t time.Time) string {
-	var s string
+	// handle relative time quickly
+	if (l.flag & LReltime) != 0 {
+		d := t.Sub(_startTime)
+		if (l.flag & Lmicroseconds) == 0 {
+			d = d.Round(time.Millisecond)
+		}
+		return "+" + d.String()
+	}
 
-	//*buf = append(*buf, l.prefix...)
+	// Full date/time formatting
+	var s string
 	if l.flag&(Ldate|Ltime|Lmicroseconds) != 0 {
 		if l.flag&Ldate != 0 {
 			year, month, day := t.Date()
