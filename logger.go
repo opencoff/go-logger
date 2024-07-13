@@ -9,52 +9,53 @@
 //
 // The list of enhancements are:
 //
-//  - All I/O is done in an asynchronous go-routine; thus, the caller
-//    does not incur any overhead beyond the formatting of the
-//    strings.
+//   - All I/O is done in an asynchronous go-routine; thus, the caller
+//     does not incur any overhead beyond the formatting of the
+//     strings.
 //
-//  - Log levels define a heirarchy (from most-verbose to
-//    least-verbose):
-//      LOG_DEBUG
-//      LOG_INFO
-//      LOG_WARNING
-//      LOG_ERR
-//      LOG_CRIT
-//      LOG_EMERG
+//   - Log levels define a heirarchy (from most-verbose to
+//     least-verbose):
 //
-//  - An instance of a logger is configured with a given log level;
-//    and it only prints log messages "above" the configured level.
-//    e.g., if a logger is configured with level of INFO, then it will
-//    print all log messages with INFO and higher priority;
-//    in particular, it won't print DEBUG messages.
+//     LOG_DEBUG
+//     LOG_INFO
+//     LOG_WARNING
+//     LOG_ERR
+//     LOG_CRIT
+//     LOG_EMERG
 //
-//  - A single program can have multiple loggers; each with a
-//    different priority.
+//   - An instance of a logger is configured with a given log level;
+//     and it only prints log messages "above" the configured level.
+//     e.g., if a logger is configured with level of INFO, then it will
+//     print all log messages with INFO and higher priority;
+//     in particular, it won't print DEBUG messages.
 //
-//  - The logger method Backtrace() will print a stack backtrace to
-//    the configured output stream. Log levels are NOT
-//    considered when backtraces are printed.
+//   - A single program can have multiple loggers; each with a
+//     different priority.
 //
-//  - The Panic() and Fatal() logger methods implicitly print the
-//    stack backtrace (upto 5 levels).
+//   - The logger method Backtrace() will print a stack backtrace to
+//     the configured output stream. Log levels are NOT
+//     considered when backtraces are printed.
 //
-//  - DEBUG, ERR, CRIT log outputs (via Debug(), Err() and Crit()
-//    methods) also print the source file location from whence they
-//    were invoked.
+//   - The Panic() and Fatal() logger methods implicitly print the
+//     stack backtrace (upto 5 levels).
 //
-//  - New package functions to create a syslog(1) or a file logger
-//    instance.
+//   - DEBUG, ERR, CRIT log outputs (via Debug(), Err() and Crit()
+//     methods) also print the source file location from whence they
+//     were invoked.
 //
-//  - Callers can create a new logger instance if they have an
-//    io.writer instance of their own - in case the existing output
-//    streams (File and Syslog) are insufficient.
+//   - New package functions to create a syslog(1) or a file logger
+//     instance.
 //
-//  - Any logger instance can create child-loggers with a different
-//    priority and prefix (but same destination); this is useful in large
-//    programs with different modules.
+//   - Callers can create a new logger instance if they have an
+//     io.writer instance of their own - in case the existing output
+//     streams (File and Syslog) are insufficient.
 //
-//  - Compressed log rotation based on daily ToD (configurable ToD) -- only
-//    available for file-backed destinations.
+//   - Any logger instance can create child-loggers with a different
+//     priority and prefix (but same destination); this is useful in large
+//     programs with different modules.
+//
+//   - Compressed log rotation based on daily ToD (configurable ToD) -- only
+//     available for file-backed destinations.
 package logger
 
 import (
@@ -67,6 +68,7 @@ import (
 	stdlog "log"
 	"log/syslog"
 	"os"
+	"path"
 	"runtime"
 	"strings"
 	"sync"
@@ -99,12 +101,12 @@ const (
 
 // Log priority. These form a heirarchy:
 //
-//   LOG_DEBUG
-//   LOG_INFO
-//   LOG_WARNING
-//   LOG_ERR
-//   LOG_CRIT
-//   LOG_EMERG
+//	LOG_DEBUG
+//	LOG_INFO
+//	LOG_WARNING
+//	LOG_ERR
+//	LOG_CRIT
+//	LOG_EMERG
 //
 // An instance of a logger is configured with a given log level;
 // and it only prints log messages "above" the configured level.
@@ -126,12 +128,6 @@ const (
 	// keep in the end
 	logMax
 )
-
-var _startTime time.Time
-
-func init() {
-	_startTime = time.Now().UTC()
-}
 
 // Map string names to actual priority levels. Useful for taking log
 // levels defined in config files and turning them into usable
@@ -180,10 +176,9 @@ func (p Priority) String() string {
 // abstraction together. There is only ever _one_ instance of this
 // struct in a top-level logger.
 type outch struct {
-	closing uint32
-	closed  uint32      // atomically set/read
-	logch   chan string // buffered channel
-	wg      sync.WaitGroup
+	logch  chan string // buffered channel
+	closed atomic.Bool
+	wg     sync.WaitGroup
 }
 
 // A Logger represents an active logging object that generates lines of
@@ -199,6 +194,7 @@ type Logger struct {
 	count  uint64     // count of # of log lines so far - used for rel-timestamp
 	name   string     // file name for file backed logs
 
+	start  time.Time // start time when the logger was created
 	rot_tm time.Time // UTC time when file should be rotated
 	rot_n  int       // number of days of logs to keep
 
@@ -220,6 +216,7 @@ func newLogger(ll *Logger) (*Logger, error) {
 		ll.prefix = fmt.Sprintf("[%s] ", ll.prefix)
 	}
 
+	ll.start = time.Now().UTC()
 	ll.ch.wg.Add(1)
 	go ll.qrunner()
 
@@ -232,11 +229,10 @@ func (l *Logger) Close() error {
 		return nil
 	}
 
-	atomic.SwapUint32(&l.ch.closing, 1)
-	if atomic.SwapUint32(&l.ch.closed, 1) == 0 {
+	if !l.ch.closed.Swap(true) {
 		close(l.ch.logch)
+		l.ch.wg.Wait()
 	}
-	l.ch.wg.Wait()
 	return nil
 }
 
@@ -260,8 +256,8 @@ func (l *Logger) New(prefix string, prio Priority) *Logger {
 	nl := &Logger{out: l.out, prio: prio, flag: l.flag, ch: l.ch}
 
 	if len(prefix) > 0 {
-		oldpref := barePrefix(l.prefix)
 		if (l.flag & lPrefix) != 0 {
+			oldpref := barePrefix(l.prefix)
 			nl.prefix = fmt.Sprintf("[%s-%s] ", oldpref, prefix)
 		} else {
 			nl.prefix = fmt.Sprintf("[%s] ", prefix)
@@ -270,6 +266,9 @@ func (l *Logger) New(prefix string, prio Priority) *Logger {
 	}
 
 	nl.flag |= lSublog
+
+	// XXX Do we use the start-time from parent?
+	nl.start = time.Now().UTC()
 	return nl
 }
 
@@ -328,11 +327,11 @@ func NewFilelog(file string, prio Priority, prefix string, flag int) (*Logger, e
 // XXX What happens on Win32?
 func NewSyslog(prio Priority, prefix string, flag int) (*Logger, error) {
 	flag &= ^(lSyslog | lPrefix | lClose)
+	tag := path.Base(os.Args[0])
 
-	wr, err := syslog.New(syslog.LOG_NOTICE|syslog.LOG_DAEMON, "")
+	wr, err := syslog.New(syslog.LOG_NOTICE|syslog.LOG_DAEMON, tag)
 	if err != nil {
-		s := fmt.Sprintf("Can't open SYSLOG connection: %s", err)
-		return nil, errors.New(s)
+		return nil, fmt.Errorf("%s: syslog: %w", tag, err)
 	}
 
 	return newLogger(&Logger{out: wr, prio: prio, prefix: prefix, flag: flag | lSyslog})
@@ -368,7 +367,7 @@ func (l *Logger) EnableRotation(hh, mm, ss int, max int) error {
 	defer l.mu.Unlock()
 
 	if (l.flag & lClose) == 0 {
-		return fmt.Errorf("logger is not file backed")
+		return fmt.Errorf("%s: logger is not file backed", l.prefix)
 	}
 
 	if hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 59 {
@@ -419,9 +418,9 @@ func (l *Logger) Output(calldepth int, prio Priority, s string) {
 }
 
 // Dump stack backtrace for 'depth' levels
-// Backtrace is of the form "file:line [func name]"
-// NB: The absolute pathname of the file is used in the backtrace -
-//     regardless of the logger flags requesting shortfile.
+// Backtrace is of the form "file:line [func name]".
+// NB: The absolute pathname of the file is used in the backtrace;
+// regardless of the logger flags requesting shortfile.
 func (l *Logger) Backtrace(depth int) {
 	var pc []uintptr = make([]uintptr, 64)
 	var wr strings.Builder
@@ -629,9 +628,9 @@ func (l *Logger) formatHeader(t time.Time) string {
 		if atomic.AddUint64(&l.count, 1) == 0 {
 			return l.fullTimestamp(t)
 		}
-		d := t.Sub(_startTime)
+		d := t.Sub(l.start)
 		if (l.flag & Lmicroseconds) == 0 {
-			d = d.Round(time.Millisecond)
+			d = d.Round(time.Microsecond)
 		}
 		return "+" + d.String()
 	}
@@ -650,25 +649,22 @@ func (l *Logger) ofmt(calldepth int, prio Priority, s string) string {
 		return s
 	}
 
-	var buf string
+	var b strings.Builder
 
 	// Put the timestamp and priority only if we are NOT syslog
 	if (l.flag & lSyslog) == 0 {
 		now := time.Now().UTC()
-		buf = fmt.Sprintf("<%d>:%s ", prio, l.formatHeader(now))
+		fmt.Fprintf(&b, "<%d>:%s ", prio, l.formatHeader(now))
 	}
 
 	if (l.flag & lPrefix) != 0 {
-		buf += l.prefix
+		b.WriteString(l.prefix)
 	}
 
 	if calldepth > 0 {
-		var file string
-		var line int
-		var finfo string
 		if l.flag&(Lshortfile|Llongfile) != 0 {
 			var ok bool
-			_, file, line, ok = runtime.Caller(calldepth)
+			_, file, line, ok := runtime.Caller(calldepth)
 			if !ok {
 				file = "???"
 				line = 0
@@ -683,21 +679,16 @@ func (l *Logger) ofmt(calldepth int, prio Priority, s string) string {
 				}
 				file = short
 			}
-			finfo = fmt.Sprintf("(%s:%d) ", file, line)
-		}
-
-		if len(finfo) > 0 {
-			buf += finfo
+			fmt.Fprintf(&b, "(%s:%d) ", file, line)
 		}
 	}
 
-	//buf = append(buf, fmt.Sprintf(":<%d>: ", prio)...)
-	buf += s
+	b.WriteString(s)
 	if s[len(s)-1] != '\n' {
-		buf += "\n"
+		b.WriteRune('\n')
 	}
 
-	return buf
+	return b.String()
 }
 
 // Write to the underlying FD directly; INTERNAL USE ONLY
@@ -712,12 +703,8 @@ func (l *Logger) directWrite(calldepth int, prio Priority, s string) {
 // Enqueue a write to be flushed by qrunner()
 // Senders are responsible for closing the channel - but only once.
 func (l *Logger) qwrite(s string) {
-	if z := atomic.LoadUint32(&l.ch.closing); z == 0 {
+	if !l.ch.closed.Load() {
 		l.ch.logch <- s
-	} else {
-		if atomic.SwapUint32(&l.ch.closed, 1) == 0 {
-			close(l.ch.logch)
-		}
 	}
 }
 
