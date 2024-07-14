@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	re "regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -145,23 +148,41 @@ func TestLog(t *testing.T) {
 }
 
 func TestConcurrent(t *testing.T) {
+	const maxG int = 5000
 	assert := newAsserter(t, "")
 	var wr bytes.Buffer
+	var wg sync.WaitGroup
+	var i int
 
-	ll, err := New(&wr, LOG_INFO, "", 0)
+	ll, err := New(&wr, LOG_INFO, "", Ldate|Ltime|Lmicroseconds|Lfileloc)
 	assert(err == nil, "can't make logger: %s", err)
 
-	go func() {
-		for i := 0; i < 5000; i++ {
-			go func(i int, l *Logger) {
-				for j := 0; j < 100; j++ {
-					ll.Info("go-%d: Log message %d", i, j)
-					time.Sleep(5 * time.Microsecond)
-				}
-			}(i, ll)
+	var c atomic.Uint64
+	fn := func(i int, l *Logger, wg *sync.WaitGroup) {
+		for j := 0; j < 100; j++ {
+			ll.Info("go-%d: Log message %d", i, j)
+			c.Add(1)
+			time.Sleep(5 * time.Microsecond)
 		}
-	}()
+		wg.Done()
+	}
 
-	// abruptly close
+	for i = 0; i < min(100, maxG); i++ {
+		wg.Add(1)
+		go fn(i, ll, &wg)
+	}
+
+	time.Sleep(2 * time.Second)
+
 	ll.Close()
+	wg.Wait()
+
+	logs := wr.String()
+	exp := uint64(strings.Count(logs, "\n"))
+
+	// the first and last lines are from the logger itself.
+	// XXX We don't have a test for log rotation.
+	saw := 2 + c.Load()
+
+	assert(exp == saw, "log lines: exp %d, saw %d", exp, saw)
 }

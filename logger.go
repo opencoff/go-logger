@@ -141,6 +141,9 @@ const (
 	// Maximum number of daily logs we will store
 	_MAX_LOGFILES     = 7
 	_PANIC_BACKTRACES = 6
+
+	// line length of a log buffer
+	_LOGBUFSZ = 256
 )
 
 // Log Priorities
@@ -169,6 +172,7 @@ var prioName = map[string]Priority{
 	"LOG_ERROR":   LOG_ERR,
 	"LOG_CRIT":    LOG_CRIT,
 	"LOG_EMERG":   LOG_EMERG,
+	"LOG_NONE":    LOG_NONE,
 
 	"DEBUG":     LOG_DEBUG,
 	"INFO":      LOG_INFO,
@@ -180,6 +184,7 @@ var prioName = map[string]Priority{
 	"CRITICAL":  LOG_CRIT,
 	"EMERG":     LOG_EMERG,
 	"EMERGENCY": LOG_EMERG,
+	"NONE":      LOG_NONE,
 }
 
 // Map log priorities to their string names
@@ -190,6 +195,7 @@ var prioString = map[Priority]string{
 	LOG_ERR:     "ERROR",
 	LOG_CRIT:    "CRITICAL",
 	LOG_EMERG:   "EMERGENCY",
+	LOG_NONE:    "NONE",
 }
 
 func (p Priority) String() string {
@@ -207,6 +213,7 @@ type outch struct {
 	logch  chan qev // buffered channel
 	closed atomic.Bool
 	wg     sync.WaitGroup
+	pool   sync.Pool
 }
 
 // A Logger represents an active logging object that generates lines of
@@ -229,25 +236,6 @@ type Logger struct {
 
 	// cached pointer of stdlogger
 	stdlogger atomic.Pointer[stdlog.Logger]
-}
-
-// make a async goroutine for doing actual I/O
-func newLogger(ll *Logger) (*Logger, error) {
-	ch := make(chan qev)
-	//ch := make(chan qev, runtime.NumCPU())
-	ll.ch = &outch{logch: ch}
-
-	if len(ll.prefix) > 0 {
-		ll.flag |= lPrefix
-		ll.prefix = fmt.Sprintf("[%s] ", ll.prefix)
-	}
-
-	ll.start = time.Now().UTC()
-	ll.dprintf(0, LOG_INFO, "Logger at level %s started.", ll.prio.String())
-	ll.ch.wg.Add(1)
-	go ll.qrunner()
-
-	return ll, nil
 }
 
 func barePrefix(s string) string {
@@ -286,6 +274,38 @@ func ToPriority(s string) (p Priority, ok bool) {
 	return
 }
 
+// make a new logger instance
+func newLogger(out io.Writer, prio Priority, pref string, flag int) *Logger {
+	if len(pref) > 0 {
+		flag |= lPrefix
+		pref = fmt.Sprintf("[%s] ", pref)
+	}
+
+	// default priority is important messages
+	if prio <= 0 {
+		prio = LOG_WARNING
+	}
+
+	ll := &Logger{
+		prio:   prio,
+		prefix: pref,
+		flag:   flag,
+		out:    out,
+		start:  time.Now().UTC(),
+		ch: &outch{
+			logch: make(chan qev, runtime.NumCPU()),
+			pool: sync.Pool{
+				New: func() any { return make([]byte, 0, _LOGBUFSZ) },
+			},
+		},
+	}
+
+	ll.dprintf(0, LOG_INFO, "Logger at level %s started.", ll.prio.String())
+	ll.ch.wg.Add(1)
+	go ll.qrunner()
+	return ll
+}
+
 // Creates a new Logger instance at the given priority. The log output is
 // sent to 'out' - an `io.Writer`.
 // The prefix appears at the beginning of each generated log line.
@@ -293,7 +313,7 @@ func ToPriority(s string) (p Priority, ok bool) {
 // file & line numbers.
 func New(out io.Writer, prio Priority, prefix string, flag int) (*Logger, error) {
 	flag = defaultFlag(flag)
-	return newLogger(&Logger{out: out, prio: prio, prefix: prefix, flag: flag})
+	return newLogger(out, prio, prefix, defaultFlag(flag)), nil
 }
 
 // Creates a new file-backed logger instance at the given priority.
@@ -304,8 +324,6 @@ func New(out io.Writer, prio Priority, prefix string, flag int) (*Logger, error)
 // NB: This is the only constructor that allows you to subsequently
 // configure a log-rotator.
 func NewFilelog(file string, prio Priority, prefix string, flag int) (*Logger, error) {
-	flag = defaultFlag(flag)
-
 	// We use O_RDWR because we will likely rotate the file and it
 	// will help us to seek(0) and read the logs for purposes of
 	// compressing it.
@@ -315,8 +333,9 @@ func NewFilelog(file string, prio Priority, prefix string, flag int) (*Logger, e
 		return nil, errors.New(s)
 	}
 
-	l := &Logger{out: logfd, prio: prio, prefix: prefix, flag: flag | lClose, name: file}
-	return newLogger(l)
+	ll := newLogger(logfd, prio, prefix, defaultFlag(flag)|lClose)
+	ll.name = file
+	return ll, nil
 }
 
 // Creates a new syslog-backed logger instance at the given priority.
@@ -326,7 +345,7 @@ func NewFilelog(file string, prio Priority, prefix string, flag int) (*Logger, e
 //
 // *NB*: This is not supported/tested on Win32/Win64.
 func NewSyslog(prio Priority, prefix string, flag int) (*Logger, error) {
-	flag &= ^(lSyslog | lPrefix | lClose)
+	flag = defaultFlag(flag)
 	tag := path.Base(os.Args[0])
 
 	wr, err := syslog.New(syslog.LOG_NOTICE|syslog.LOG_DAEMON, tag)
@@ -334,7 +353,7 @@ func NewSyslog(prio Priority, prefix string, flag int) (*Logger, error) {
 		return nil, fmt.Errorf("%s: syslog: %w", tag, err)
 	}
 
-	return newLogger(&Logger{out: wr, prio: prio, prefix: prefix, flag: flag | lSyslog})
+	return newLogger(wr, prio, prefix, flag|lSyslog), nil
 }
 
 // Creates a new logging instance. The log destination is controlled by the
@@ -350,7 +369,6 @@ func NewSyslog(prio Priority, prefix string, flag int) (*Logger, error) {
 // The flag argument defines the logging properties such as timestamps,
 // file & line numbers.
 func NewLogger(name string, prio Priority, prefix string, flag int) (*Logger, error) {
-
 	flag = defaultFlag(flag)
 	switch strings.ToUpper(name) {
 	case "NONE":
@@ -374,28 +392,31 @@ func NewLogger(name string, prio Priority, prefix string, flag int) (*Logger, er
 // This is useful when different components in a large program want
 // their own log-prefix (for easier debugging)
 func (l *Logger) New(prefix string, prio Priority) *Logger {
-	if prio == LOG_NONE {
+	if prio <= 0 {
 		prio = l.prio
 	}
 
-	nl := &Logger{out: l.out, prio: prio, flag: l.flag, ch: l.ch}
+	nl := &Logger{
+		prio: prio,
+		flag: l.flag | lSublog,
+		out:  l.out,
+
+		// We use the same start time for relative-timestamps; the output
+		// destination is the same regardless of whether a Logger instance
+		// is the parent instance or one of the descendants.
+		start: l.start,
+		ch:    l.ch,
+	}
 
 	if len(prefix) > 0 {
 		if (l.flag & lPrefix) != 0 {
 			oldpref := barePrefix(l.prefix)
-			nl.prefix = fmt.Sprintf("[%s-%s] ", oldpref, prefix)
+			nl.prefix = fmt.Sprintf("[%s.%s] ", oldpref, prefix)
 		} else {
 			nl.prefix = fmt.Sprintf("[%s] ", prefix)
 		}
-		nl.flag |= lPrefix
 	}
 
-	nl.flag |= lSublog
-
-	// We use the same start time for relative-timestamps; the output
-	// destination is the same regardless of whether a Logger instance
-	// is the parent instance or one of the descendants.
-	nl.start = l.start
 	return nl
 }
 
@@ -465,12 +486,12 @@ func (l *Logger) EnableRotation(hh, mm, ss int, max int) error {
 }
 
 // Enqueue a log-write to happen asynchronously
-func (l *Logger) Output(calldepth int, prio Priority, s string) {
+func (l *Logger) Output(calldepth int, prio Priority, s string, v ...interface{}) {
 	if calldepth > 0 {
 		calldepth += 1
 	}
-	t := l.ofmt(calldepth, prio, s)
 
+	t := l.ofmt(calldepth, prio, s, v...)
 	l.qwrite(t)
 }
 
@@ -480,32 +501,25 @@ func (l *Logger) Output(calldepth int, prio Priority, s string) {
 // regardless of the logger flags requesting shortfile.
 func (l *Logger) Backtrace(depth int) {
 	s := backTrace(depth+1, l.flag)
-	l.qwrite(s)
+	l.qwrite([]byte(s))
 }
 
 // Predicate that returns true if we can log at level prio
 func (l *Logger) Loggable(prio Priority) bool {
-	return l.prio >= LOG_NONE && prio >= l.prio
+	return l.prio > LOG_NONE && prio >= l.prio
 }
 
 // Printf calls l.Output to print to the logger.
 // Arguments are handled in the manner of fmt.Printf.
 func (l *Logger) Printf(format string, v ...interface{}) {
-	l.Output(0, LOG_INFO, fmt.Sprintf(format, v...))
-}
-
-// Print calls l.Output to print to the logger.
-// Arguments are handled in the manner of fmt.Print.
-func (l *Logger) Print(v ...interface{}) {
-	l.Output(0, LOG_INFO, fmt.Sprint(v...))
+	l.Output(0, LOG_INFO, format, v...)
 }
 
 // Panicf is equivalent to l.Printf() followed by a call to panic().
 func (l *Logger) Panic(format string, v ...interface{}) {
 	bt := backTrace(_PANIC_BACKTRACES, l.flag)
 	s := fmt.Sprintf(format, v...)
-	l.Output(2, LOG_EMERG, s)
-	l.Output(0, LOG_EMERG, bt)
+	l.Output(2, LOG_EMERG, "%s:\n%s", s, bt)
 	l.Close()
 	panic(s)
 }
@@ -518,40 +532,35 @@ func (l *Logger) Fatal(format string, v ...interface{}) {
 // Crit prints logs at level CRIT
 func (l *Logger) Crit(format string, v ...interface{}) {
 	if l.Loggable(LOG_CRIT) {
-		s := fmt.Sprintf(format, v...)
-		l.Output(2, LOG_CRIT, s)
+		l.Output(2, LOG_CRIT, format, v...)
 	}
 }
 
 // Err prints logs at level ERR
 func (l *Logger) Error(format string, v ...interface{}) {
 	if l.Loggable(LOG_ERR) {
-		s := fmt.Sprintf(format, v...)
-		l.Output(2, LOG_ERR, s)
+		l.Output(2, LOG_ERR, format, v...)
 	}
 }
 
 // Warn prints logs at level WARNING
 func (l *Logger) Warn(format string, v ...interface{}) {
 	if l.Loggable(LOG_WARNING) {
-		s := fmt.Sprintf(format, v...)
-		l.Output(0, LOG_WARNING, s)
+		l.Output(0, LOG_WARNING, format, v...)
 	}
 }
 
 // Info prints logs at level INFO
 func (l *Logger) Info(format string, v ...interface{}) {
 	if l.Loggable(LOG_INFO) {
-		s := fmt.Sprintf(format, v...)
-		l.Output(0, LOG_INFO, s)
+		l.Output(0, LOG_INFO, format, v...)
 	}
 }
 
 // Debug prints logs at level INFO
 func (l *Logger) Debug(format string, v ...interface{}) {
 	if l.Loggable(LOG_DEBUG) {
-		s := fmt.Sprintf(format, v...)
-		l.Output(2, LOG_DEBUG, s)
+		l.Output(2, LOG_DEBUG, format, v...)
 	}
 }
 
@@ -564,25 +573,11 @@ func (l *Logger) Prio() Priority {
 	return l.prio
 }
 
-// Set priority
-func (l *Logger) SetPrio(prio Priority) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.prio = prio
-}
-
 // Flags returns the output flags for the logger.
 func (l *Logger) Flags() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.flag
-}
-
-// SetFlags sets the output flags for the logger.
-func (l *Logger) SetFlags(flag int) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.flag = flag
 }
 
 // Prefix returns the output prefix for the logger.
@@ -592,88 +587,20 @@ func (l *Logger) Prefix() string {
 	return l.prefix
 }
 
-// SetPrefix sets the output prefix for the logger.
-func (l *Logger) SetPrefix(prefix string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.prefix = prefix
-}
-
 // -- Internal functions --
 
-// Cheap integer to fixed-width decimal ASCII.  Give a negative width to avoid zero-padding.
-// Knows the buffer has capacity.
-func itoa(i int, wid int) string {
-	var u uint = uint(i)
-	if u == 0 && wid <= 1 {
-		return "0"
-	}
-
-	// Assemble decimal in reverse order.
-	var b [32]byte
-	bp := len(b)
-	for ; u > 0 || wid > 0; u /= 10 {
-		bp--
-		wid--
-		b[bp] = byte(u%10) + '0'
-	}
-
-	return string(b[bp:])
-}
-
-// make a printable timestamp out of 't' using the flags 'fl'
-func timestamp(t time.Time, fl int) string {
-	if fl&(Ldate|Ltime|Lmicroseconds) == 0 {
-		return ""
-	}
-
-	var w strings.Builder
-	if fl&Ldate != 0 {
-		year, month, day := t.Date()
-
-		w.WriteString(itoa(year, 4))
-		w.WriteString("/")
-		w.WriteString(itoa(int(month), 2))
-		w.WriteString("/")
-		w.WriteString(itoa(day, 2))
-	}
-
-	if fl&(Ltime|Lmicroseconds) != 0 {
-		hour, min, sec := t.Clock()
-
-		// this is now the microsec offset within the second
-		microsecs := t.Nanosecond() / 1000
-
-		if w.Len() > 0 {
-			w.WriteString(" ")
-		}
-		w.WriteString(itoa(hour, 2))
-		w.WriteString(":")
-		w.WriteString(itoa(min, 2))
-		w.WriteString(":")
-		w.WriteString(itoa(sec, 2))
-		w.WriteString(".")
-		if fl&Lmicroseconds != 0 {
-			w.WriteString(itoa(microsecs, 6))
-		} else {
-			w.WriteString(itoa(microsecs/1000, 3))
-		}
-	}
-	return w.String()
-}
-
-func (l *Logger) formatHeader(t time.Time) string {
+func (l *Logger) formatHeader(out []byte, t time.Time) []byte {
 	if (l.flag & Lreltime) == 0 {
-		return timestamp(t, l.flag)
+		return timestamp(out, t, l.flag)
 	}
 
 	// if this is the first time, do the full time stamp so we have a
 	// baseline reference
 	if ok := l.relstart.Swap(true); !ok {
-		return timestamp(t, l.flag|Ldate|Ltime)
+		return timestamp(out, t, l.flag|Ldate|Ltime)
 	}
 	d := t.Sub(l.start)
-	return "+" + d.String()
+	return fmt.Appendf(out, "+%s", d.String())
 }
 
 // Output formats the output for a logging event.  The string s contains
@@ -682,24 +609,26 @@ func (l *Logger) formatHeader(t time.Time) string {
 // already a newline.  Calldepth is used to recover the PC and is
 // provided for generality, although at the moment on all pre-defined
 // paths it will be 2.
-func (l *Logger) ofmt(calldepth int, prio Priority, s string) string {
-	if len(s) == 0 {
-		return s
-	}
+func (l *Logger) ofmt(calldepth int, prio Priority, s string, v ...interface{}) []byte {
+	b := l.getBuf()
 
-	var b strings.Builder
+	if len(s) == 0 {
+		return b
+	}
 
 	// Put the timestamp and priority only if we are NOT syslog
 	if (l.flag & lSyslog) == 0 {
 		now := time.Now().UTC()
-		fmt.Fprintf(&b, "<%d>:%s ", prio, l.formatHeader(now))
+		b = fmt.Appendf(b, "<%d>:", prio)
+		b = l.formatHeader(b, now)
+		b = append(b, ' ')
 	}
 
 	if (l.flag & lPrefix) != 0 {
-		b.WriteString(l.prefix)
+		b = append(b, l.prefix...)
 	}
 
-	if calldepth > 0 && (l.flag & Lfileloc) > 0 {
+	if calldepth > 0 && (l.flag&Lfileloc) > 0 {
 		var ok bool
 		_, file, line, ok := runtime.Caller(calldepth)
 		if !ok {
@@ -711,26 +640,25 @@ func (l *Logger) ofmt(calldepth int, prio Priority, s string) string {
 		if (l.flag & Lfullpath) == 0 {
 			file = path.Base(file)
 		}
-		fmt.Fprintf(&b, "(%s:%d) ", file, line)
+		b = fmt.Appendf(b, "(%s:%d) ", file, line)
 	}
 
-	b.WriteString(s)
-	if s[len(s)-1] != '\n' {
-		b.WriteRune('\n')
+	b = fmt.Appendf(b, s, v...)
+	if len(b) > 0 && b[len(b)-1] != '\n' {
+		b = append(b, '\n')
 	}
 
-	return b.String()
+	return b
 }
 
 // printf style logger that write directly to the underlying writer without going
 // through the queue
 func (l *Logger) dprintf(depth int, pr Priority, s string, args ...interface{}) {
-	t := fmt.Sprintf(s, args...)
 	if depth > 0 {
 		depth += 1
 	}
-	x := l.ofmt(depth, pr, t)
-	l.out.Write([]byte(x))
+	x := l.ofmt(depth, pr, s, args...)
+	l.out.Write(x)
 }
 
 // type of event that goes into the qrunner channel
@@ -743,22 +671,22 @@ const (
 
 // qev records the action to be taken by the qrunner goroutine
 type qev struct {
-	ty qevt
-	s  string
+	ty  qevt
+	buf []byte
 }
 
 // Enqueue a write to be flushed by qrunner()
 // Senders are responsible for closing the channel - but only once.
-func (l *Logger) qwrite(s string) {
+func (l *Logger) qwrite(b []byte) {
 	if !l.ch.closed.Load() {
-		l.ch.logch <- qev{_QEV_LOG, s}
+		l.ch.logch <- qev{_QEV_LOG, b}
 	}
 }
 
 // Enqueue a timer expirty to be handled by qrunner()
 func (l *Logger) qtimer() {
 	if !l.ch.closed.Load() {
-		l.ch.logch <- qev{_QEV_TIMER, ""}
+		l.ch.logch <- qev{_QEV_TIMER, nil}
 	}
 }
 
@@ -769,7 +697,8 @@ func (l *Logger) qrunner() {
 	for e := range l.ch.logch {
 		switch e.ty {
 		case _QEV_LOG:
-			l.out.Write([]byte(e.s))
+			l.out.Write(e.buf)
+			l.putBuf(e.buf)
 
 		case _QEV_TIMER:
 			if 0 != (l.flag & lRotate) {
@@ -785,6 +714,15 @@ func (l *Logger) qrunner() {
 			l.dprintf(0, LOG_ERR, "logger: unknown event type %d in qrunner", e.ty)
 		}
 	}
+}
+
+func (l *Logger) getBuf() []byte {
+	b := l.ch.pool.Get()
+	return b.([]byte)
+}
+
+func (l *Logger) putBuf(b []byte) {
+	l.ch.pool.Put(b[:0])
 }
 
 // Rotate current file out
@@ -884,6 +822,68 @@ fail:
 	l.Error("switching to STDERR for future logs ..")
 	l.flag &= ^lClose
 	return
+}
+
+// Cheap integer to fixed-width decimal ASCII.  Give a negative width to avoid zero-padding.
+func itoa(out []byte, i int, wid int) []byte {
+	var u uint = uint(i)
+	var b [32]byte
+
+	bp := len(b) - 1
+	for u >= 10 || wid > 1 {
+		wid--
+		q := u / 10
+		b[bp] = byte('0' + u - q*10)
+		bp--
+		u = q
+	}
+	// u < 10
+	b[bp] = byte('0' + u)
+	return append(out, b[bp:]...)
+}
+
+// make a printable timestamp out of 't' using the flags 'fl'
+func timestamp(out []byte, t time.Time, fl int) []byte {
+	if fl&(Ldate|Ltime|Lmicroseconds) == 0 {
+		return out
+	}
+
+	date := false
+	if fl&Ldate != 0 {
+		year, month, day := t.Date()
+
+		out = itoa(out, year, 4)
+		out = append(out, '/')
+		out = itoa(out, int(month), 2)
+		out = append(out, '/')
+		out = itoa(out, day, 2)
+		date = true
+	}
+
+	if fl&(Ltime|Lmicroseconds) != 0 {
+		hour, min, sec := t.Clock()
+
+		// this is now the microsec offset within the second
+		microsecs := t.Nanosecond() / 1000
+
+		if date {
+			out = append(out, ' ')
+		}
+
+		out = itoa(out, hour, 2)
+		out = append(out, ':')
+		out = itoa(out, min, 2)
+		out = append(out, ':')
+		out = itoa(out, sec, 2)
+		out = append(out, '.')
+
+		if fl&Lmicroseconds != 0 {
+			out = itoa(out, microsecs, 6)
+		} else {
+			out = itoa(out, microsecs/1000, 3)
+		}
+	}
+	return out
 }
 
 // Rotate files of the form fn.NN where 0 <= NN < max

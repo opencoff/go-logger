@@ -46,7 +46,7 @@ func (l *Logger) StdLogger() *stdlog.Logger {
 
 // We only provide an ioWriter implementation for stdlogger
 func (l *Logger) Write(b []byte) (int, error) {
-	l.qwrite(string(b))
+	l.qwrite(b)
 	return len(b), nil
 }
 
