@@ -12,12 +12,9 @@ import (
 
 // Return an instance of self that satisfies stdlib logger
 func (l *Logger) StdLogger() *stdlog.Logger {
+	var g *stdlog.Logger
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	gl := l.gl
-	if gl == nil {
+	if g = l.stdlogger.Load(); g == nil {
 		fl := stdlog.LUTC
 		if 0 != (l.flag & Ldate) {
 			fl |= stdlog.Ldate
@@ -28,20 +25,23 @@ func (l *Logger) StdLogger() *stdlog.Logger {
 		if 0 != (l.flag & Lmicroseconds) {
 			fl |= stdlog.Lmicroseconds
 		}
-		if 0 != (l.flag & Llongfile) {
-			fl |= stdlog.Llongfile
-		}
-		if 0 != (l.flag & Lshortfile) {
-			fl |= stdlog.Lshortfile
+		if 0 != (l.flag & Lfileloc) {
+			if 0 != (l.flag & Lfullpath) {
+				fl |= stdlog.Llongfile
+			} else {
+				fl |= stdlog.Lshortfile
+			}
 		}
 
 		// here first argument 'l' is the io.Writer; we provide its
 		// interface implementation below.
-		gl = stdlog.New(l, l.prefix, fl)
-		l.gl = gl
-	}
+		g = stdlog.New(l, l.prefix, fl)
 
-	return gl
+		if !l.stdlogger.CompareAndSwap(nil, g) {
+			g = l.stdlogger.Load()
+		}
+	}
+	return g
 }
 
 // We only provide an ioWriter implementation for stdlogger

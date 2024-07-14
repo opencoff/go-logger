@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-func newAsserter(t *testing.T) func(cond bool, msg string, args ...interface{}) {
+func newAsserter(t *testing.T, pref string) func(cond bool, msg string, args ...interface{}) {
 	return func(cond bool, msg string, args ...interface{}) {
 		if cond {
 			return
@@ -32,6 +32,9 @@ func newAsserter(t *testing.T) func(cond bool, msg string, args ...interface{}) 
 			line = 0
 		}
 
+		if len(pref) > 0 {
+			msg = fmt.Sprintf("%s: %s", pref, msg)
+		}
 		s := fmt.Sprintf(msg, args...)
 		t.Fatalf("%s: %d: Assertion failed: %s\n", file, line, s)
 	}

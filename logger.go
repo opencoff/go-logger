@@ -13,6 +13,30 @@
 //     does not incur any overhead beyond the formatting of the
 //     strings.
 //
+//   - Logger and timestamps:
+//
+//   - Date, time are optional logging elements; the flags
+//     `Ldate`, `Ltime` when used in the 'flag' argument
+//     of the constructor functions will determine if date OR time
+//     is logged.
+//
+//   - Logger implicitly works and logs date/time in UTC (NEVER localtime).
+//
+//   - The time is by default logged at millisecond resolution;
+//     the flag `Lmicroseconds` causes timestamps to be printed in
+//     microsecond resolution.
+//
+//   - A Logger instance can log relative timestamps with the flag
+//     `Lreltime`. Relative timestamps are always logged at the full resolution
+//     of the available OS time source (Nanoseconds on major platforms).
+//     Use of `Lreltime` supercedes `Ldate` and `Ltime`.
+//
+//   - *NB*: when `Lreltime` is in effect, the very first log
+//     message will have a full timestamp and *NOT* the relative timestamp.
+//     This is to ensure that there is a frame of reference for future
+//     log messages. Similarly, when log files are rotated, the first line after
+//     rotation will have the full absolute timestamp.
+//
 //   - Log levels define a heirarchy (from most-verbose to
 //     least-verbose):
 //
@@ -25,9 +49,9 @@
 //
 //   - An instance of a logger is configured with a given log level;
 //     and it only prints log messages "above" the configured level.
-//     e.g., if a logger is configured with level of INFO, then it will
-//     print all log messages with INFO and higher priority;
-//     in particular, it won't print DEBUG messages.
+//     e.g., if a logger is configured with level of `INFO`, then it will
+//     print all log messages with `INFO` and higher priority;
+//     in particular, it won't print `DEBUG` messages.
 //
 //   - A single program can have multiple loggers; each with a
 //     different priority.
@@ -36,14 +60,15 @@
 //     the configured output stream. Log levels are NOT
 //     considered when backtraces are printed.
 //
-//   - The Panic() and Fatal() logger methods implicitly print the
+//   - The `Panic()` and `Fatal()` logger methods implicitly print the
 //     stack backtrace (upto 5 levels).
 //
-//   - DEBUG, ERR, CRIT log outputs (via Debug(), Err() and Crit()
+//   - `DEBUG, ERR, CRIT` log outputs (via `Debug(), Err() and Crit()`
 //     methods) also print the source file location from whence they
-//     were invoked.
+//     were invoked. `Lfullpath` flag is honored for the backtrace.
 //
-//   - New package functions to create a syslog(1) or a file logger
+//   - A Logger instance can be turned into a stdlib's Logger via the
+//     `Logger.StdLogger()` method.
 //     instance.
 //
 //   - Callers can create a new logger instance if they have an
@@ -85,9 +110,9 @@ const (
 	Ldate         = 1 << iota // the date: 2009/01/23
 	Ltime                     // the time: 01:23:23
 	Lmicroseconds             // microsecond resolution: 01:23:23.123123.  assumes Ltime.
-	Llongfile                 // full file name and line number: /a/b/c/d.go:23
-	Lshortfile                // final file name element and line number: d.go:23. overrides Llongfile
-	LReltime                  // print relative time from start of program
+	Lfileloc                  // put file name and line number in the log
+	Lfullpath                 // full file path and line number: /a/b/c/d.go:23
+	Lreltime                  // print relative time from start of program
 
 	// Internal flags
 	lSyslog // set to indicate that output destination is syslog; Ldate|Ltime|Lmicroseconds are ignored
@@ -96,7 +121,7 @@ const (
 	lSublog // Set if this is a sub-logger
 	lRotate // Rotate the logs
 
-	LstdFlags = Ldate | Ltime // initial values for the standard logger
+	Lstdflag = Ldate | Ltime // initial values for the standard logger
 )
 
 // Log priority. These form a heirarchy:
@@ -112,8 +137,11 @@ const (
 // and it only prints log messages "above" the configured level.
 type Priority int
 
-// Maximum number of daily logs we will store
-const MAX_LOGFILES = 7
+const (
+	// Maximum number of daily logs we will store
+	_MAX_LOGFILES     = 7
+	_PANIC_BACKTRACES = 6
+)
 
 // Log Priorities
 const (
@@ -176,7 +204,7 @@ func (p Priority) String() string {
 // abstraction together. There is only ever _one_ instance of this
 // struct in a top-level logger.
 type outch struct {
-	logch  chan string // buffered channel
+	logch  chan qev // buffered channel
 	closed atomic.Bool
 	wg     sync.WaitGroup
 }
@@ -191,25 +219,23 @@ type Logger struct {
 	prefix string     // prefix to write at beginning of each line
 	flag   int        // properties
 	out    io.Writer  // destination for output
-	count  uint64     // count of # of log lines so far - used for rel-timestamp
 	name   string     // file name for file backed logs
 
-	start  time.Time // start time when the logger was created
-	rot_tm time.Time // UTC time when file should be rotated
-	rot_n  int       // number of days of logs to keep
+	relstart atomic.Bool
+	start    time.Time // start time when the logger was created
+	rot_n    int       // number of days of logs to keep
 
-	ch   *outch    // output chan
-	wait chan bool // wait chan for closing the log
+	ch *outch // output chan
 
-	gl *stdlog.Logger // cached pointer to stdlogger if any; created by StdLogger()
+	// cached pointer of stdlogger
+	stdlogger atomic.Pointer[stdlog.Logger]
 }
 
 // make a async goroutine for doing actual I/O
 func newLogger(ll *Logger) (*Logger, error) {
-
-	oo := &outch{logch: make(chan string, 64)}
-	ll.ch = oo
-	ll.wait = make(chan bool)
+	ch := make(chan qev)
+	//ch := make(chan qev, runtime.NumCPU())
+	ll.ch = &outch{logch: ch}
 
 	if len(ll.prefix) > 0 {
 		ll.flag |= lPrefix
@@ -217,32 +243,131 @@ func newLogger(ll *Logger) (*Logger, error) {
 	}
 
 	ll.start = time.Now().UTC()
+	ll.dprintf(0, LOG_INFO, "Logger at level %s started.", ll.prio.String())
 	ll.ch.wg.Add(1)
 	go ll.qrunner()
 
 	return ll, nil
 }
 
-// Close the logger and wait for I/O to complete
-func (l *Logger) Close() error {
-	if 0 != (l.flag & lSublog) {
-		return nil
+func barePrefix(s string) string {
+	if s[0] == '[' {
+		s = s[1:]
 	}
-
-	if !l.ch.closed.Swap(true) {
-		close(l.ch.logch)
-		l.ch.wg.Wait()
+	if i := strings.LastIndex(s, "] "); i > 0 {
+		s = s[:i]
 	}
-	return nil
+	return s
 }
 
-// Creates a new Logger instance. The 'out' variable sets the
-// destination to which log data will be written.
+func defaultFlag(flag int) int {
+	if flag == 0 {
+		flag = Lstdflag
+	}
+
+	// Reltime overrides any date+timestamp
+	// We however retain Lmicroseconds
+	if (flag & Lreltime) != 0 {
+		flag &= ^(Ldate | Ltime)
+	}
+
+	if (flag & Lfullpath) > 0 {
+		flag |= Lfileloc
+	}
+
+	flag &= ^(lSyslog | lPrefix | lClose)
+	return flag
+}
+
+// Convert a string to equivalent Priority
+func ToPriority(s string) (p Priority, ok bool) {
+	s = strings.ToUpper(s)
+	p, ok = prioName[s]
+	return
+}
+
+// Creates a new Logger instance at the given priority. The log output is
+// sent to 'out' - an `io.Writer`.
 // The prefix appears at the beginning of each generated log line.
-// The flag argument defines the logging properties.
+// The flag argument defines the logging properties such as timestamps,
+// file & line numbers.
 func New(out io.Writer, prio Priority, prefix string, flag int) (*Logger, error) {
 	flag = defaultFlag(flag)
 	return newLogger(&Logger{out: out, prio: prio, prefix: prefix, flag: flag})
+}
+
+// Creates a new file-backed logger instance at the given priority.
+// This function erases the previous file contents.  The prefix appears
+// at the beginning of each generated log line.  The flag argument defines
+// the logging properties such as timestamps, file & line numbers.
+//
+// NB: This is the only constructor that allows you to subsequently
+// configure a log-rotator.
+func NewFilelog(file string, prio Priority, prefix string, flag int) (*Logger, error) {
+	flag = defaultFlag(flag)
+
+	// We use O_RDWR because we will likely rotate the file and it
+	// will help us to seek(0) and read the logs for purposes of
+	// compressing it.
+	logfd, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_SYNC, 0600)
+	if err != nil {
+		s := fmt.Sprintf("Can't open log file '%s': %s", file, err)
+		return nil, errors.New(s)
+	}
+
+	l := &Logger{out: logfd, prio: prio, prefix: prefix, flag: flag | lClose, name: file}
+	return newLogger(l)
+}
+
+// Creates a new syslog-backed logger instance at the given priority.
+// The prefix appears at the beginning of each generated log line.
+// The flag argument defines the logging properties such as timestamps,
+// file & line numbers.
+//
+// *NB*: This is not supported/tested on Win32/Win64.
+func NewSyslog(prio Priority, prefix string, flag int) (*Logger, error) {
+	flag &= ^(lSyslog | lPrefix | lClose)
+	tag := path.Base(os.Args[0])
+
+	wr, err := syslog.New(syslog.LOG_NOTICE|syslog.LOG_DAEMON, tag)
+	if err != nil {
+		return nil, fmt.Errorf("%s: syslog: %w", tag, err)
+	}
+
+	return newLogger(&Logger{out: wr, prio: prio, prefix: prefix, flag: flag | lSyslog})
+}
+
+// Creates a new logging instance. The log destination is controlled by the
+// 'name' argument. It can be one of:
+//
+//   - "NONE": sends output to the equivalent of /dev/null. ie "null output logger"
+//   - "SYSLOG": sends output to `syslog(3)`
+//   - "STDOUT": sends output to the calling process' `STDOUT` stream
+//   - "STDERR": sends output to the calling process' `STDERR` stream
+//   - file path: sends output to the named file.
+//
+// The prefix appears at the beginning of each generated log line.
+// The flag argument defines the logging properties such as timestamps,
+// file & line numbers.
+func NewLogger(name string, prio Priority, prefix string, flag int) (*Logger, error) {
+
+	flag = defaultFlag(flag)
+	switch strings.ToUpper(name) {
+	case "NONE":
+		return New(&nullWriter{}, prio, prefix, flag)
+
+	case "SYSLOG":
+		return NewSyslog(prio, prefix, flag)
+
+	case "STDOUT":
+		return New(os.Stdout, prio, prefix, flag)
+
+	case "STDERR":
+		return New(os.Stderr, prio, prefix, flag)
+
+	default:
+		return NewFilelog(name, prio, "", flag)
+	}
 }
 
 // Create a new Sub-Logger with a different prefix and priority.
@@ -267,96 +392,33 @@ func (l *Logger) New(prefix string, prio Priority) *Logger {
 
 	nl.flag |= lSublog
 
-	// XXX Do we use the start-time from parent?
-	nl.start = time.Now().UTC()
+	// We use the same start time for relative-timestamps; the output
+	// destination is the same regardless of whether a Logger instance
+	// is the parent instance or one of the descendants.
+	nl.start = l.start
 	return nl
 }
 
-func barePrefix(s string) string {
-	if s[0] == '[' {
-		s = s[1:]
-	}
-	if i := strings.LastIndex(s, "] "); i > 0 {
-		s = s[:i]
-	}
-	return s
-}
-
-// Convert a string to equivalent Priority
-func ToPriority(s string) (p Priority, ok bool) {
-	s = strings.ToUpper(s)
-	p, ok = prioName[s]
-	return
-}
-
-func defaultFlag(flag int) int {
-	if flag == 0 {
-		flag = Ldate | Ltime | Lshortfile | Lmicroseconds
+// Close the logger and wait for I/O to complete
+func (l *Logger) Close() error {
+	if 0 != (l.flag & lSublog) {
+		return nil
 	}
 
-	// Reltime overrides any date+timestamp
-	// We however retain Lmicroseconds
-	if (flag & LReltime) != 0 {
-		flag &= ^(Ldate | Ltime)
+	if !l.ch.closed.Swap(true) {
+		close(l.ch.logch)
+		l.ch.wg.Wait()
+
+		// Log when we close the logger and include the caller info
+		l.dprintf(1, LOG_INFO, "Logger at level %s closed.", l.prio.String())
+
+		if (l.flag & lClose) != 0 {
+			if fd, ok := l.out.(io.WriteCloser); ok {
+				return fd.Close()
+			}
+		}
 	}
-
-	flag &= ^(lSyslog | lPrefix | lClose)
-	return flag
-}
-
-// Open a new file logger to write logs to 'file'.
-// This function erases the previous file contents. This is the only
-// constructor that allows you to subsequently configure a log-rotator.
-func NewFilelog(file string, prio Priority, prefix string, flag int) (*Logger, error) {
-	flag = defaultFlag(flag)
-
-	// We use O_RDWR because we will likely rotate the file and it
-	// will help us to seek(0) and read the logs for purposes of
-	// compressing it.
-	logfd, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_SYNC, 0600)
-	if err != nil {
-		s := fmt.Sprintf("Can't open log file '%s': %s", file, err)
-		return nil, errors.New(s)
-	}
-
-	l := &Logger{out: logfd, prio: prio, prefix: prefix, flag: flag | lClose, name: file}
-	return newLogger(l)
-}
-
-// Open a new syslog logger.
-// XXX What happens on Win32?
-func NewSyslog(prio Priority, prefix string, flag int) (*Logger, error) {
-	flag &= ^(lSyslog | lPrefix | lClose)
-	tag := path.Base(os.Args[0])
-
-	wr, err := syslog.New(syslog.LOG_NOTICE|syslog.LOG_DAEMON, tag)
-	if err != nil {
-		return nil, fmt.Errorf("%s: syslog: %w", tag, err)
-	}
-
-	return newLogger(&Logger{out: wr, prio: prio, prefix: prefix, flag: flag | lSyslog})
-}
-
-// Create a new file logger or syslog logger
-func NewLogger(name string, prio Priority, prefix string, flag int) (*Logger, error) {
-
-	flag = defaultFlag(flag)
-	switch strings.ToUpper(name) {
-	case "NONE": // for test purposes
-		return New(&nullWriter{}, prio, prefix, flag)
-
-	case "SYSLOG":
-		return NewSyslog(prio, prefix, flag)
-
-	case "STDOUT":
-		return New(os.Stdout, prio, prefix, flag)
-
-	case "STDERR":
-		return New(os.Stderr, prio, prefix, flag)
-
-	default:
-		return NewFilelog(name, prio, "", flag)
-	}
+	return nil
 }
 
 // Enable log rotation to happen every day at 'hh:mm:ss' (24-hour
@@ -382,28 +444,23 @@ func (l *Logger) EnableRotation(hh, mm, ss int, max int) error {
 	// For debugging log-rotate logic
 	//x  = n.Add(2 * time.Minute)
 
-	// If we somehow ended up in "yesterday", then set the reminder
+	// If we ended up in "yesterday", then set the reminder
 	// for the "next day"
 	if x.Before(n) {
 		x = x.Add(24 * time.Hour)
 	}
 
 	if max <= 0 {
-		max = MAX_LOGFILES
+		max = _MAX_LOGFILES
 	}
 
-	/*
-	   l.directWrite(0, LOG_INFO,
-	                 fmt.Sprintf("logger: enabling daily log-rotation (keep %d days); first rotate at %s",
-	                                max, x.Format(time.RFC822Z)))
-	*/
-	l.Info("logger: enabling daily log-rotation (keep %d days); first rotate at %s",
+	l.Info("logger: Enabled daily log-rotation (keep %d days); first rotation at %s",
 		max, x.Format(time.RFC822Z))
 
-	l.rot_tm = x
-	l.rot_n = max
 	l.flag |= lRotate
-
+	l.rot_n = max
+	d := x.Sub(n)
+	time.AfterFunc(d, l.qtimer)
 	return nil
 }
 
@@ -422,34 +479,8 @@ func (l *Logger) Output(calldepth int, prio Priority, s string) {
 // NB: The absolute pathname of the file is used in the backtrace;
 // regardless of the logger flags requesting shortfile.
 func (l *Logger) Backtrace(depth int) {
-	var pc []uintptr = make([]uintptr, 64)
-	var wr strings.Builder
-
-	// runtime.Callers() requires a pre-created array.
-	n := runtime.Callers(3, pc)
-
-	if depth == 0 || depth > n {
-		depth = n
-	} else if n > depth {
-		n = depth
-	}
-
-	wr.WriteString("Backtrace:\n    ")
-	for i := 0; i < n; i++ {
-		var s string = "    *unknown*\n"
-		p := pc[i]
-		f := runtime.FuncForPC(p)
-
-		if f != nil {
-			nm := f.Name()
-			file, line := f.FileLine(p)
-			s = fmt.Sprintf("    %s:%d [%s]\n", file, line, nm)
-		}
-		wr.WriteString(s)
-	}
-	wr.WriteRune('\n')
-
-	l.qwrite(wr.String())
+	s := backTrace(depth+1, l.flag)
+	l.qwrite(s)
 }
 
 // Predicate that returns true if we can log at level prio
@@ -469,20 +500,19 @@ func (l *Logger) Print(v ...interface{}) {
 	l.Output(0, LOG_INFO, fmt.Sprint(v...))
 }
 
-// Fatalf is equivalent to l.Printf() followed by a call to os.Exit(1).
-func (l *Logger) Fatal(format string, v ...interface{}) {
-	l.Output(2, LOG_EMERG, fmt.Sprintf(format, v...))
-	l.Close()
-	os.Exit(1)
-}
-
 // Panicf is equivalent to l.Printf() followed by a call to panic().
 func (l *Logger) Panic(format string, v ...interface{}) {
+	bt := backTrace(_PANIC_BACKTRACES, l.flag)
 	s := fmt.Sprintf(format, v...)
 	l.Output(2, LOG_EMERG, s)
-	l.Backtrace(5)
+	l.Output(0, LOG_EMERG, bt)
 	l.Close()
 	panic(s)
+}
+
+// Fatalf is equivalent to l.Printf() followed by a call to os.Exit(1).
+func (l *Logger) Fatal(format string, v ...interface{}) {
+	l.Panic(format, v...)
 }
 
 // Crit prints logs at level CRIT
@@ -591,51 +621,59 @@ func itoa(i int, wid int) string {
 	return string(b[bp:])
 }
 
-// Full date/time formatting
-func (l *Logger) fullTimestamp(t time.Time) string {
-	var s string
-	if l.flag&(Ldate|Ltime|Lmicroseconds) != 0 {
-		if l.flag&Ldate != 0 {
-			year, month, day := t.Date()
-			s += itoa(year, 4)
-			s += "/"
-			s += itoa(int(month), 2)
-			s += "/"
-			s += itoa(day, 2)
-		}
-		if l.flag&(Ltime|Lmicroseconds) != 0 {
-			hour, min, sec := t.Clock()
+// make a printable timestamp out of 't' using the flags 'fl'
+func timestamp(t time.Time, fl int) string {
+	if fl&(Ldate|Ltime|Lmicroseconds) == 0 {
+		return ""
+	}
 
-			s += " "
-			s += itoa(hour, 2)
-			s += ":"
-			s += itoa(min, 2)
-			s += ":"
-			s += itoa(sec, 2)
-			if l.flag&Lmicroseconds != 0 {
-				s += "."
-				s += itoa(t.Nanosecond()/1e3, 6)
-			}
+	var w strings.Builder
+	if fl&Ldate != 0 {
+		year, month, day := t.Date()
+
+		w.WriteString(itoa(year, 4))
+		w.WriteString("/")
+		w.WriteString(itoa(int(month), 2))
+		w.WriteString("/")
+		w.WriteString(itoa(day, 2))
+	}
+
+	if fl&(Ltime|Lmicroseconds) != 0 {
+		hour, min, sec := t.Clock()
+
+		// this is now the microsec offset within the second
+		microsecs := t.Nanosecond() / 1000
+
+		if w.Len() > 0 {
+			w.WriteString(" ")
+		}
+		w.WriteString(itoa(hour, 2))
+		w.WriteString(":")
+		w.WriteString(itoa(min, 2))
+		w.WriteString(":")
+		w.WriteString(itoa(sec, 2))
+		w.WriteString(".")
+		if fl&Lmicroseconds != 0 {
+			w.WriteString(itoa(microsecs, 6))
+		} else {
+			w.WriteString(itoa(microsecs/1000, 3))
 		}
 	}
-	return s
+	return w.String()
 }
 
 func (l *Logger) formatHeader(t time.Time) string {
-	// handle relative time quickly
-	if (l.flag & LReltime) != 0 {
-		// if this is the first time, do the full time stamp.
-		if atomic.AddUint64(&l.count, 1) == 0 {
-			return l.fullTimestamp(t)
-		}
-		d := t.Sub(l.start)
-		if (l.flag & Lmicroseconds) == 0 {
-			d = d.Round(time.Microsecond)
-		}
-		return "+" + d.String()
+	if (l.flag & Lreltime) == 0 {
+		return timestamp(t, l.flag)
 	}
 
-	return l.fullTimestamp(t)
+	// if this is the first time, do the full time stamp so we have a
+	// baseline reference
+	if ok := l.relstart.Swap(true); !ok {
+		return timestamp(t, l.flag|Ldate|Ltime)
+	}
+	d := t.Sub(l.start)
+	return "+" + d.String()
 }
 
 // Output formats the output for a logging event.  The string s contains
@@ -661,26 +699,19 @@ func (l *Logger) ofmt(calldepth int, prio Priority, s string) string {
 		b.WriteString(l.prefix)
 	}
 
-	if calldepth > 0 {
-		if l.flag&(Lshortfile|Llongfile) != 0 {
-			var ok bool
-			_, file, line, ok := runtime.Caller(calldepth)
-			if !ok {
-				file = "???"
-				line = 0
-			}
-			if l.flag&Lshortfile != 0 {
-				short := file
-				for i := len(file) - 1; i > 0; i-- {
-					if file[i] == '/' {
-						short = file[i+1:]
-						break
-					}
-				}
-				file = short
-			}
-			fmt.Fprintf(&b, "(%s:%d) ", file, line)
+	if calldepth > 0 && (l.flag & Lfileloc) > 0 {
+		var ok bool
+		_, file, line, ok := runtime.Caller(calldepth)
+		if !ok {
+			file = "???"
+			line = 0
 		}
+
+		// if caller requested short names, trim it
+		if (l.flag & Lfullpath) == 0 {
+			file = path.Base(file)
+		}
+		fmt.Fprintf(&b, "(%s:%d) ", file, line)
 	}
 
 	b.WriteString(s)
@@ -691,20 +722,43 @@ func (l *Logger) ofmt(calldepth int, prio Priority, s string) string {
 	return b.String()
 }
 
-// Write to the underlying FD directly; INTERNAL USE ONLY
-func (l *Logger) directWrite(calldepth int, prio Priority, s string) {
-	if calldepth > 0 {
-		calldepth += 1
+// printf style logger that write directly to the underlying writer without going
+// through the queue
+func (l *Logger) dprintf(depth int, pr Priority, s string, args ...interface{}) {
+	t := fmt.Sprintf(s, args...)
+	if depth > 0 {
+		depth += 1
 	}
-	t := l.ofmt(calldepth, prio, s)
-	l.out.Write([]byte(t))
+	x := l.ofmt(depth, pr, t)
+	l.out.Write([]byte(x))
+}
+
+// type of event that goes into the qrunner channel
+type qevt int
+
+const (
+	_QEV_LOG   = iota // event type is to log a message
+	_QEV_TIMER        // event signals timer expiry (log rotation)
+)
+
+// qev records the action to be taken by the qrunner goroutine
+type qev struct {
+	ty qevt
+	s  string
 }
 
 // Enqueue a write to be flushed by qrunner()
 // Senders are responsible for closing the channel - but only once.
 func (l *Logger) qwrite(s string) {
 	if !l.ch.closed.Load() {
-		l.ch.logch <- s
+		l.ch.logch <- qev{_QEV_LOG, s}
+	}
+}
+
+// Enqueue a timer expirty to be handled by qrunner()
+func (l *Logger) qtimer() {
+	if !l.ch.closed.Load() {
+		l.ch.logch <- qev{_QEV_TIMER, ""}
 	}
 }
 
@@ -712,131 +766,167 @@ func (l *Logger) qwrite(s string) {
 func (l *Logger) qrunner() {
 	defer l.ch.wg.Done()
 
-	for s := range l.ch.logch {
-		if 0 != (l.flag & lRotate) {
-			n := time.Now().UTC()
-			d := l.rot_tm.Sub(n)
-			//l.directWrite(0, LOG_DEBUG, fmt.Sprintf("rot: now=%s, delta=%s", n, d))
-			if d < 0 {
+	for e := range l.ch.logch {
+		switch e.ty {
+		case _QEV_LOG:
+			l.out.Write([]byte(e.s))
+
+		case _QEV_TIMER:
+			if 0 != (l.flag & lRotate) {
 				l.rotateLog()
 
-				// Set next rotation for +24 hours
-				l.rot_tm = n.Add(24 * time.Hour)
-
 				// reset the counter so the first log message has full time stamp.
-				atomic.StoreUint64(&l.count, 0)
+				l.relstart.Store(false)
 
-				l.directWrite(0, LOG_INFO,
-					fmt.Sprintf("Log rotation complete. Next rotate at %s..",
-						l.rot_tm.Format(time.RFC822Z)))
+				l.dprintf(0, LOG_INFO, "Log rotation complete. Next rotate in +24 hours.")
+				time.AfterFunc(24*time.Hour, l.qtimer)
 			}
-		}
-
-		l.out.Write([]byte(s))
-	}
-
-	if (l.flag & lClose) != 0 {
-		if fd, ok := l.out.(io.WriteCloser); ok {
-			fd.Close()
+		default:
+			l.dprintf(0, LOG_ERR, "logger: unknown event type %d in qrunner", e.ty)
 		}
 	}
 }
 
 // Rotate current file out
 func (l *Logger) rotateLog() {
-	//fmt.Printf("Logger: Compressing & Rotating file %s ..\n", l.name)
+	var gfd *gzip.Writer
+	var wfd *os.File
+	var err error
+	var errstr string
+	var gz, gztmp string
 
 	fd, ok := l.out.(*os.File)
 	if !ok {
 		panic("logger: rotatelog wants a file - but seems to be corrupted")
 	}
 
-	fd.Sync()
-	fd.Seek(0, 0)
+	errf := func(err error, s string, args ...interface{}) string {
+		s = fmt.Sprintf("logger %s: logrotate: %s", l.prefix, s)
+		s = fmt.Sprintf(s, args...)
+		s = fmt.Sprintf("%s: %s", s, err)
+		return s
+	}
 
-	// First rotate the older files
-	rotatefile(l.name, l.rot_n)
-
-	var gfd *gzip.Writer
-	var wfd *os.File
-	var err error
-
-	// Now, compress the current file and store it
-	gz := fmt.Sprintf("%s.0.gz", l.name)
-	gztmp := fmt.Sprintf("%s.%v", l.name, rand64())
-	wfd, err = os.OpenFile(gztmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Can't create %s for log rotation: %s", gztmp, err)
+	if err = fd.Sync(); err != nil {
+		errstr = errf(err, "%s flush", l.name)
 		goto fail
 	}
 
-	gfd, err = gzip.NewWriterLevel(wfd, 9)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "can't initialize gzip %s for log rotation: %s", gztmp, err)
+	if _, err = fd.Seek(0, 0); err != nil {
+		errstr = errf(err, "%s seek0 to start rotation", l.name)
+		goto fail
+	}
+
+	// First rotate the older files
+	if err = rotatefile(l.name, l.rot_n); err != nil {
+		errstr = errf(err, "rotate")
+		goto fail
+	}
+
+	// Now, compress the current file and store it
+	gz = fmt.Sprintf("%s.0.gz", l.name)
+	gztmp = fmt.Sprintf("%s.%x", l.name, rand64())
+
+	if wfd, err = os.OpenFile(gztmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err != nil {
+		errstr = errf(err, "% create", gztmp)
+		goto fail
+	}
+
+	if gfd, err = gzip.NewWriterLevel(wfd, 9); err != nil {
+		errstr = errf(err, "%s gzip", gztmp)
 		goto fail1
 	}
 
-	_, err = io.Copy(gfd, fd)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "can't write gzip %s for log rotation: %s", gztmp, err)
+	if _, err = io.Copy(gfd, fd); err != nil {
+		errstr = errf(err, "%s gzip copy", gztmp)
 		goto fail1
 	}
 
-	err = gfd.Close()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "can't write gzip %s for log rotation: %s", gztmp, err)
+	if err = gfd.Close(); err != nil {
+		errstr = errf(err, "%s gzip close", gztmp)
 		goto fail1
 	}
 
-	wfd.Close()
-	os.Rename(gztmp, gz)
+	if err = wfd.Close(); err != nil {
+		errstr = errf(err, "%s close", gztmp)
+		goto fail2
+	}
 
-	//fmt.Printf("(re)opening old logfile %s..\n", l.name)
-	fd.Truncate(0)
-	fd.Seek(0, 0)
+	if err = os.Rename(gztmp, gz); err != nil {
+		errstr = errf(err, "%s to %s rename", gztmp, gz)
+		goto fail2
+	}
+
+	if err = fd.Truncate(0); err != nil {
+		errstr = errf(err, "%s truncate", l.name)
+		goto fail
+	}
+
+	if _, err = fd.Seek(0, 0); err != nil {
+		errstr = errf(err, "%s seek0", l.name)
+		goto fail
+	}
 
 	return
 
 fail1:
 	wfd.Close()
+
+fail2:
 	os.Remove(gztmp)
 
-	// XXX This is a horrible sequence of things that follows
+	// When all else fails - start to log to stderr - hopefully daemons started by
+	// supervisory regimes will redirect the log messages to syslog or some other place.
 fail:
 	fd.Close()
 	l.out = os.Stderr
-	fmt.Fprintf(os.Stderr, "Switching logging to Stderr...")
+	l.Error(errstr)
+	l.Error("switching to STDERR for future logs ..")
 	l.flag &= ^lClose
 	return
 }
 
 // Rotate files of the form fn.NN where 0 <= NN < max
 // Delete the oldest file (NN == max-1)
-func rotatefile(fn string, max int) {
-
+func rotatefile(fn string, max int) error {
 	old := fmt.Sprintf("%s.%d.gz", fn, max-1)
-	os.Remove(old)
+	if err := os.Remove(old); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("%s rm: %w", old, err)
+	}
 
 	// Now, we iterate from max-1 to 0
 	for i := max - 1; i > 0; i -= 1 {
 		older := old
 		old = fmt.Sprintf("%s.%d.gz", fn, i-1)
-		if exists(old) {
-			os.Rename(old, older)
+		err, ok := exists(old)
+		if err != nil {
+			return fmt.Errorf("%s rm?: %w", old, err)
+		} else if !ok {
+			continue
+		}
+
+		if err = os.Rename(old, older); err != nil {
+			return fmt.Errorf("%s to %s rename: %w", old, older, err)
 		}
 	}
+	return nil
 }
 
 // Predicate - returns true if file 'fn' exists; false otherwise
-func exists(fn string) bool {
-	_, err := os.Stat(fn)
-	if os.IsNotExist(err) {
-		return false
+func exists(fn string) (error, bool) {
+	fi, err := os.Stat(fn)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false
+		}
+		return err, false
 	}
 
-	// XXX Should we check for IsRegular() ?
-	return true
+	if fi.Mode().IsRegular() {
+		return nil, true
+	}
+
+	return fmt.Errorf("%s not a regular file", fn), false
 }
 
 // 64 bit random integer
@@ -844,6 +934,57 @@ func rand64() uint64 {
 	var b [8]byte
 	rand.Read(b[:])
 	return binary.BigEndian.Uint64(b[:])
+}
+
+// fetch backtrace info to 'depth' callers
+func backTrace(depth, flag int) string {
+	var wr strings.Builder
+	var pcv [64]uintptr
+
+	// runtime.Callers() requires a pre-created array.
+	n := runtime.Callers(3, pcv[:])
+	if n == 0 {
+		wr.WriteString("no backtrace frames!")
+		return wr.String()
+	}
+
+	if depth == 0 {
+		depth = n
+	}
+
+	if n > depth {
+		n = depth
+	}
+
+	frames := runtime.CallersFrames(pcv[:n])
+
+	wr.WriteString("--backtrace:\n")
+
+	for {
+		var s string
+
+		n -= 1
+		f, more := frames.Next()
+		file := f.File
+		if (flag & Lfullpath) == 0 {
+			file = path.Base(file)
+		}
+
+		if fn := f.Func; fn != nil {
+			off := f.PC - fn.Entry()
+			s = fmt.Sprintf("\t%2d: %q:%d [%s +%#x]\n", n, file, f.Line, fn.Name(), off)
+		} else {
+			s = fmt.Sprintf("\t%2d: %q:%d [unknown addr %#x]\n", n, file, f.Line, f.PC)
+		}
+		wr.WriteString(s)
+
+		if !more {
+			break
+		}
+	}
+	wr.WriteString("--end backtrace\n")
+
+	return wr.String()
 }
 
 // null writer
