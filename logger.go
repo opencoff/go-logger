@@ -659,6 +659,9 @@ func (l *Logger) dprintf(depth int, pr Priority, s string, args ...interface{}) 
 	}
 	x := l.ofmt(depth, pr, s, args...)
 	l.out.Write(x)
+
+	// don't forget to return the buffer to the pool
+	l.putBuf(x)
 }
 
 // type of event that goes into the qrunner channel
