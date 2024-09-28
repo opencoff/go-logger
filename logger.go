@@ -349,7 +349,7 @@ func newLogger(out io.Writer, prio Priority, pref string, flag int) *xLogger {
 		},
 	}
 
-	ll.dprintf(0, LOG_INFO, "xLogger at level %s started.", ll.prio.String())
+	ll.dprintf(0, LOG_INFO, "Logger at level %s started.", ll.prio.String())
 	ll.ch.wg.Add(1)
 	go ll.qrunner()
 	return ll
