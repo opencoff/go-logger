@@ -158,7 +158,7 @@ func TestConcurrent(t *testing.T) {
 	assert(err == nil, "can't make logger: %s", err)
 
 	var c atomic.Uint64
-	fn := func(i int, l *Logger, wg *sync.WaitGroup) {
+	fn := func(i int, l Logger, wg *sync.WaitGroup) {
 		for j := 0; j < 100; j++ {
 			ll.Info("go-%d: Log message %d", i, j)
 			c.Add(1)

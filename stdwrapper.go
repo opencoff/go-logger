@@ -10,32 +10,36 @@ import (
 	stdlog "log"
 )
 
+func fl2std(flag int) int {
+	fl := stdlog.LUTC
+	if 0 != (flag & Ldate) {
+		fl |= stdlog.Ldate
+	}
+	if 0 != (flag & Ltime) {
+		fl |= stdlog.Ltime
+	}
+	if 0 != (flag & Lmicroseconds) {
+		fl |= stdlog.Lmicroseconds
+	}
+	if 0 != (flag & Lfileloc) {
+		if 0 != (flag & Lfullpath) {
+			fl |= stdlog.Llongfile
+		} else {
+			fl |= stdlog.Lshortfile
+		}
+	}
+
+	return fl
+}
+
 // Return an instance of self that satisfies stdlib logger
-func (l *Logger) StdLogger() *stdlog.Logger {
+func (l *xLogger) StdLogger() *stdlog.Logger {
 	var g *stdlog.Logger
 
 	if g = l.stdlogger.Load(); g == nil {
-		fl := stdlog.LUTC
-		if 0 != (l.flag & Ldate) {
-			fl |= stdlog.Ldate
-		}
-		if 0 != (l.flag & Ltime) {
-			fl |= stdlog.Ltime
-		}
-		if 0 != (l.flag & Lmicroseconds) {
-			fl |= stdlog.Lmicroseconds
-		}
-		if 0 != (l.flag & Lfileloc) {
-			if 0 != (l.flag & Lfullpath) {
-				fl |= stdlog.Llongfile
-			} else {
-				fl |= stdlog.Lshortfile
-			}
-		}
-
 		// here first argument 'l' is the io.Writer; we provide its
 		// interface implementation below.
-		g = stdlog.New(l, l.prefix, fl)
+		g = stdlog.New(l, l.prefix, fl2std(l.flag))
 
 		if !l.stdlogger.CompareAndSwap(nil, g) {
 			g = l.stdlogger.Load()
@@ -45,8 +49,18 @@ func (l *Logger) StdLogger() *stdlog.Logger {
 }
 
 // We only provide an ioWriter implementation for stdlogger
-func (l *Logger) Write(b []byte) (int, error) {
+func (l *xLogger) Write(b []byte) (int, error) {
 	l.qwrite(b)
+	return len(b), nil
+}
+
+// provide implementations for the nul logger as well
+
+func (e *emptyLogger) StdLogger() *stdlog.Logger {
+	return stdlog.New(e, e.prefix, fl2std(0))
+}
+
+func (e *emptyLogger) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
