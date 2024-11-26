@@ -437,6 +437,11 @@ func NewLogger(name string, prio Priority, prefix string, flag int) (Logger, err
 	}
 }
 
+// NewNoneLogger creates a logger where all log entries are thrown away
+func NewNoneLogger(prio Priority, pref string) Logger {
+	return newNullLogger(pref, prio)
+}
+
 // Create a new Sub-Logger with a different prefix and priority.
 // This is useful when different components in a large program want
 // their own log-prefix (for easier debugging)
