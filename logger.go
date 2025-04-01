@@ -875,7 +875,7 @@ fail2:
 fail:
 	fd.Close()
 	l.out = os.Stderr
-	l.Error(errstr)
+	l.Error("%s", errstr)
 	l.Error("switching to STDERR for future logs ..")
 	l.flag &= ^lClose
 	return
